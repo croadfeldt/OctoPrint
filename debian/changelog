@@ -1,0 +1,6 @@
+octoprint (1.2.7) UNRELEASED; urgency=low
+  * Updated to OctoPrint 1.2.7
+  
+  * Initial release. (Closes: #XXXXXX) Initial debian package creation
+
+ -- Chris Roadfeldt <chris@roadfeldt.com>  Sun, 6 Dec 2015 01:46:43 -0600
