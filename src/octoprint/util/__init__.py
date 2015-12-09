@@ -378,6 +378,14 @@ def dict_merge(a, b):
 
 	Taken from https://www.xormedia.com/recursively-merge-dictionaries-in-python/
 
+	Example::
+
+	    >>> a = dict(foo="foo", bar="bar", fnord=dict(a=1))
+	    >>> b = dict(foo="other foo", fnord=dict(b=2, l=["some", "list"]))
+	    >>> expected = dict(foo="other foo", bar="bar", fnord=dict(a=1, b=2, l=["some", "list"]))
+	    >>> dict_merge(a, b) == expected
+	    True
+
 	Arguments:
 	    a (dict): The dictionary to merge ``b`` into
 	    b (dict): The dictionary to merge into ``a``
@@ -399,14 +407,24 @@ def dict_merge(a, b):
 	return result
 
 
-def dict_clean(a, b):
+def dict_sanitize(a, b):
 	"""
-	Recursively deep-cleans ``b`` from ``a``, removing all keys and corresponding values from ``a`` that appear in
-	``b``.
+	Recursively deep-sanitizes ``a`` based on ``b``, removing all keys (and
+	associated values) from ``a`` that do not appear in ``b``.
+
+	Example::
+
+	    >>> a = dict(foo="foo", bar="bar", fnord=dict(a=1, b=2, l=["some", "list"]))
+	    >>> b = dict(foo=None, fnord=dict(a=None, b=None))
+	    >>> expected = dict(foo="foo", fnord=dict(a=1, b=2))
+	    >>> dict_sanitize(a, b) == expected
+	    True
+	    >>> dict_clean(a, b) == expected
+	    True
 
 	Arguments:
-	    a (dict): The dictionary to clean from ``b``.
-	    b (dict): The dictionary to clean ``b`` from.
+	    a (dict): The dictionary to clean against ``b``.
+	    b (dict): The dictionary containing the key structure to clean from ``a``.
 
 	Results:
 	    dict: A new dict based on ``a`` with all keys (and corresponding values) found in ``b`` removed.
@@ -421,21 +439,87 @@ def dict_clean(a, b):
 		if not k in b:
 			del result[k]
 		elif isinstance(v, dict):
-			result[k] = dict_clean(v, b[k])
+			result[k] = dict_sanitize(v, b[k])
 		else:
 			result[k] = deepcopy(v)
 	return result
+dict_clean = deprecated("dict_clean has been renamed to dict_sanitize",
+                        includedoc="Replaced by :func:`dict_sanitize`")(dict_sanitize)
 
 
-def dict_contains_keys(a, b):
+def dict_minimal_mergediff(source, target):
 	"""
-	Recursively deep-checks if ``a`` contains all keys found in ``b``.
+	Recursively calculates the minimal dict that would be needed to be deep merged with
+	a in order to produce the same result as deep merging a and b.
 
 	Example::
 
-	    >>> dict_contains_keys(dict(foo="bar", fnord=dict(a=1, b=2, c=3)), dict(foo="some_other_bar", fnord=dict(b=100)))
+	    >>> a = dict(foo=dict(a=1, b=2), bar=dict(c=3, d=4))
+	    >>> b = dict(bar=dict(c=3, d=5), fnord=None)
+	    >>> c = dict_minimal_mergediff(a, b)
+	    >>> c == dict(bar=dict(d=5), fnord=None)
 	    True
-	    >>> dict_contains_keys(dict(foo="bar", fnord=dict(a=1, b=2, c=3)), dict(foo="some_other_bar", fnord=dict(b=100, d=20)))
+	    >>> dict_merge(a, c) == dict_merge(a, b)
+	    True
+
+	Arguments:
+	    source (dict): Source dictionary
+	    target (dict): Dictionary to compare to source dictionary and derive diff for
+
+	Returns:
+	    dict: The minimal dictionary to deep merge on ``source`` to get the same result
+	        as deep merging ``target`` on ``source``.
+	"""
+
+	if not isinstance(source, dict) or not isinstance(target, dict):
+		raise ValueError("source and target must be dictionaries")
+
+	if source == target:
+		# shortcut: if both are equal, we return an empty dict as result
+		return dict()
+
+	from copy import deepcopy
+
+	all_keys = set(source.keys() + target.keys())
+	result = dict()
+	for k in all_keys:
+		if k not in target:
+			# key not contained in target => not contained in result
+			continue
+
+		if k in source:
+			# key is present in both dicts, we have to take a look at the value
+			value_source = source[k]
+			value_target = target[k]
+
+			if value_source != value_target:
+				# we only need to look further if the values are not equal
+
+				if isinstance(value_source, dict) and isinstance(value_target, dict):
+					# both are dicts => deeper down it goes into the rabbit hole
+					result[k] = dict_minimal_mergediff(value_source, value_target)
+				else:
+					# new b wins over old a
+					result[k] = deepcopy(value_target)
+
+		else:
+			# key is new, add it
+			result[k] = deepcopy(target[k])
+	return result
+
+
+def dict_contains_keys(keys, dictionary):
+	"""
+	Recursively deep-checks if ``dictionary`` contains all keys found in ``keys``.
+
+	Example::
+
+	    >>> positive = dict(foo="some_other_bar", fnord=dict(b=100))
+	    >>> negative = dict(foo="some_other_bar", fnord=dict(b=100, d=20))
+	    >>> dictionary = dict(foo="bar", fnord=dict(a=1, b=2, c=3))
+	    >>> dict_contains_keys(positive, dictionary)
+	    True
+	    >>> dict_contains_keys(negative, dictionary)
 	    False
 
 	Arguments:
@@ -446,14 +530,14 @@ def dict_contains_keys(a, b):
 	    boolean: True if all keys found in ``b`` are also present in ``a``, False otherwise.
 	"""
 
-	if not isinstance(a, dict) or not isinstance(b, dict):
+	if not isinstance(keys, dict) or not isinstance(dictionary, dict):
 		return False
 
-	for k, v in a.iteritems():
-		if not k in b:
+	for k, v in keys.iteritems():
+		if not k in dictionary:
 			return False
 		elif isinstance(v, dict):
-			if not dict_contains_keys(v, b[k]):
+			if not dict_contains_keys(v, dictionary[k]):
 				return False
 
 	return True
@@ -500,8 +584,10 @@ def address_for_client(host, port):
 @contextlib.contextmanager
 def atomic_write(filename, mode="w+b", prefix="tmp", suffix=""):
 	temp_config = tempfile.NamedTemporaryFile(mode=mode, prefix=prefix, suffix=suffix, delete=False)
-	yield temp_config
-	temp_config.close()
+	try:
+		yield temp_config
+	finally:
+		temp_config.close()
 	shutil.move(temp_config.name, filename)
 
 
@@ -525,7 +611,32 @@ def bom_aware_open(filename, encoding="ascii", mode="r", **kwargs):
 		if header.startswith(bom):
 			encoding += "-sig"
 
-	return codecs.open(filename, encoding=encoding, **kwargs)
+	return codecs.open(filename, encoding=encoding, mode=mode, **kwargs)
+
+
+def is_hidden_path(path):
+	if path is None:
+		# we define a None path as not hidden here
+		return False
+
+	filename = os.path.basename(path)
+	if filename.startswith("."):
+		# filenames starting with a . are hidden
+		return True
+
+	if sys.platform == "win32":
+		# if we are running on windows we also try to read the hidden file
+		# attribute via the windows api
+		try:
+			import ctypes
+			attrs = ctypes.windll.kernel32.GetFileAttributesW(unicode(path))
+			assert attrs != -1     # INVALID_FILE_ATTRIBUTES == -1
+			return bool(attrs & 2) # FILE_ATTRIBUTE_HIDDEN == 2
+		except (AttributeError, AssertionError):
+			pass
+
+	# if we reach that point, the path is not hidden
+	return False
 
 
 class RepeatedTimer(threading.Thread):

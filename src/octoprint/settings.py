@@ -30,7 +30,7 @@ import logging
 import re
 import uuid
 
-from octoprint.util import atomic_write
+from octoprint.util import atomic_write, is_hidden_path
 
 _APPNAME = "OctoPrint"
 
@@ -253,9 +253,10 @@ default_settings = {
 	},
 	"scripts": {
 		"gcode": {
-			"afterPrintCancelled": "; disable motors\nM84\n\n;disable all heaters\n{% snippet 'disable_hotends' %}\nM140 S0\n\n;disable fan\nM106 S0",
+			"afterPrintCancelled": "; disable motors\nM84\n\n;disable all heaters\n{% snippet 'disable_hotends' %}\n{% snippet 'disable_bed' %}\n;disable fan\nM106 S0",
 			"snippets": {
-				"disable_hotends": "{% for tool in range(printer_profile.extruder.count) %}M104 T{{ tool }} S0\n{% endfor %}"
+				"disable_hotends": "{% for tool in range(printer_profile.extruder.count) %}M104 T{{ tool }} S0\n{% endfor %}",
+				"disable_bed": "{% if printer_profile.heatedBed %}M140 S0\n{% endif %}"
 			}
 		}
 	},
@@ -303,6 +304,11 @@ default_settings = {
 
 valid_boolean_trues = [True, "true", "yes", "y", "1"]
 """ Values that are considered to be equivalent to the boolean ``True`` value, used for type conversion in various places."""
+
+
+class NoSuchSettingsPath(BaseException):
+	pass
+
 
 class Settings(object):
 	"""
@@ -400,9 +406,11 @@ class Settings(object):
 		return folder
 
 	def _init_script_templating(self):
-		from jinja2 import Environment, BaseLoader, FileSystemLoader, ChoiceLoader, TemplateNotFound
-		from jinja2.nodes import Include, Const
+		from jinja2 import Environment, BaseLoader, ChoiceLoader, TemplateNotFound
+		from jinja2.nodes import Include
 		from jinja2.ext import Extension
+
+		from octoprint.util.jinja import FilteredFileSystemLoader
 
 		class SnippetExtension(Extension):
 			tags = {"snippet"}
@@ -492,10 +500,14 @@ class Settings(object):
 				else:
 					return template
 
-		file_system_loader = FileSystemLoader(self.getBaseFolder("scripts"))
+		path_filter = lambda path: not is_hidden_path(path)
+		file_system_loader = FilteredFileSystemLoader(self.getBaseFolder("scripts"),
+		                                              path_filter=path_filter)
 		settings_loader = SettingsScriptLoader(self)
 		choice_loader = ChoiceLoader([file_system_loader, settings_loader])
-		select_loader = SelectLoader(choice_loader, dict(bundled=settings_loader, file=file_system_loader))
+		select_loader = SelectLoader(choice_loader,
+		                             dict(bundled=settings_loader,
+		                                  file=file_system_loader))
 		return RelEnvironment(loader=select_loader, extensions=[SnippetExtension])
 
 	def _get_script_template(self, script_type, name, source=False):
@@ -810,13 +822,13 @@ class Settings(object):
 		stat = os.stat(self._configfile)
 		return stat.st_mtime
 
-	#~~ getter
+	##~~ Internal getter
 
-	def get(self, path, asdict=False, config=None, defaults=None, preprocessors=None, merged=False, incl_defaults=True):
+	def _get_value(self, path, asdict=False, config=None, defaults=None, preprocessors=None, merged=False, incl_defaults=True):
 		import octoprint.util as util
 
 		if len(path) == 0:
-			return None
+			raise NoSuchSettingsPath()
 
 		if config is None:
 			config = self._config
@@ -834,7 +846,7 @@ class Settings(object):
 				config = {}
 				defaults = defaults[key]
 			else:
-				return None
+				raise NoSuchSettingsPath()
 
 			if preprocessors and isinstance(preprocessors, dict) and key in preprocessors:
 				preprocessors = preprocessors[key]
@@ -858,7 +870,7 @@ class Settings(object):
 			elif incl_defaults and key in defaults:
 				value = defaults[key]
 			else:
-				value = None
+				raise NoSuchSettingsPath()
 
 			if preprocessors and isinstance(preprocessors, dict) and key in preprocessors and callable(preprocessors[key]):
 				value = preprocessors[key](value)
@@ -876,8 +888,34 @@ class Settings(object):
 		else:
 			return results
 
-	def getInt(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
-		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
+	#~~ has
+
+	def has(self, path, **kwargs):
+		try:
+			self._get_value(path, **kwargs)
+		except NoSuchSettingsPath:
+			return False
+		else:
+			return True
+
+	#~~ getter
+
+	def get(self, path, **kwargs):
+		error_on_path = kwargs.get("error_on_path", False)
+		new_kwargs = dict(kwargs)
+		if "error_on_path" in new_kwargs:
+			del new_kwargs["error_on_path"]
+
+		try:
+			return self._get_value(path, **new_kwargs)
+		except NoSuchSettingsPath:
+			if error_on_path:
+				raise
+			else:
+				return None
+
+	def getInt(self, path, **kwargs):
+		value = self.get(path, **kwargs)
 		if value is None:
 			return None
 
@@ -887,8 +925,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getFloat(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
-		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
+	def getFloat(self, path, **kwargs):
+		value = self.get(path, **kwargs)
 		if value is None:
 			return None
 
@@ -898,8 +936,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getBoolean(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
-		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
+	def getBoolean(self, path, **kwargs):
+		value = self.get(path, **kwargs)
 		if value is None:
 			return None
 		if isinstance(value, bool):
@@ -952,6 +990,23 @@ class Settings(object):
 
 		return script
 
+	#~~ remove
+
+	def remove(self, path, config=None):
+		if config is None:
+			config = self._config
+
+		while len(path) > 1:
+			key = path.pop(0)
+			if not isinstance(config, dict) or key not in config:
+				return
+			config = config[key]
+
+		key = path.pop(0)
+		if isinstance(config, dict) and key in config:
+			del config[key]
+		self._dirty = True
+
 	#~~ setter
 
 	def set(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
@@ -998,9 +1053,9 @@ class Settings(object):
 				config[key] = value
 			self._dirty = True
 
-	def setInt(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
+	def setInt(self, path, value, **kwargs):
 		if value is None:
-			self.set(path, None, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, None, **kwargs)
 			return
 
 		try:
@@ -1009,11 +1064,11 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when setting option %r" % (value, path))
 			return
 
-		self.set(path, intValue, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+		self.set(path, intValue, **kwargs)
 
-	def setFloat(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
+	def setFloat(self, path, value, **kwargs):
 		if value is None:
-			self.set(path, None, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, None, **kwargs)
 			return
 
 		try:
@@ -1022,15 +1077,15 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when setting option %r" % (value, path))
 			return
 
-		self.set(path, floatValue, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+		self.set(path, floatValue, **kwargs)
 
-	def setBoolean(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
+	def setBoolean(self, path, value, **kwargs):
 		if value is None or isinstance(value, bool):
-			self.set(path, value, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, value, **kwargs)
 		elif value.lower() in valid_boolean_trues:
-			self.set(path, True, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, True, **kwargs)
 		else:
-			self.set(path, False, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, False, **kwargs)
 
 	def setBaseFolder(self, type, path, force=False):
 		if type not in default_settings["folder"].keys():
@@ -1052,7 +1107,7 @@ class Settings(object):
 	def saveScript(self, script_type, name, script):
 		script_folder = self.getBaseFolder("scripts")
 		filename = os.path.realpath(os.path.join(script_folder, script_type, name))
-		if not filename.startswith(script_folder):
+		if not filename.startswith(os.path.realpath(script_folder)):
 			# oops, jail break, that shouldn't happen
 			raise ValueError("Invalid script path to save to: {filename} (from {script_type}:{name})".format(**locals()))
 

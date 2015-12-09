@@ -213,7 +213,7 @@ class Server():
 			                                                   set_preprocessors=set_preprocessors)
 			return dict(settings=plugin_settings)
 
-		def settings_plugin_config_migration(name, implementation):
+		def settings_plugin_config_migration_and_cleanup(name, implementation):
 			if not isinstance(implementation, octoprint.plugin.SettingsPlugin):
 				return
 
@@ -221,11 +221,13 @@ class Server():
 			settings_migrator = implementation.on_settings_migrate
 
 			if settings_version is not None and settings_migrator is not None:
-				stored_version = implementation._settings.get_int(["_config_version"])
+				stored_version = implementation._settings.get_int([octoprint.plugin.SettingsPlugin.config_version_key])
 				if stored_version is None or stored_version < settings_version:
 					settings_migrator(settings_version, stored_version)
-					implementation._settings.set_int(["_config_version"], settings_version)
-					implementation._settings.save()
+					implementation._settings.set_int([octoprint.plugin.SettingsPlugin.config_version_key], settings_version)
+
+			implementation.on_settings_cleanup()
+			implementation._settings.save()
 
 			implementation.on_settings_initialized()
 
@@ -235,11 +237,11 @@ class Server():
 		settingsPlugins = pluginManager.get_implementations(octoprint.plugin.SettingsPlugin)
 		for implementation in settingsPlugins:
 			try:
-				settings_plugin_config_migration(implementation._identifier, implementation)
+				settings_plugin_config_migration_and_cleanup(implementation._identifier, implementation)
 			except:
 				self._logger.exception("Error while trying to migrate settings for plugin {}, ignoring it".format(implementation._identifier))
 
-		pluginManager.implementation_post_inits=[settings_plugin_config_migration]
+		pluginManager.implementation_post_inits=[settings_plugin_config_migration_and_cleanup]
 
 		pluginManager.log_all_plugins()
 
@@ -340,7 +342,7 @@ class Server():
 		)
 		additional_mime_types=dict(mime_type_guesser=mime_type_guesser)
 		admin_validator = dict(access_validation=util.tornado.access_validation_factory(app, loginManager, util.flask.user_validator))
-		no_hidden_files_validator = dict(path_validation=util.tornado.path_validation_factory(lambda path: not os.path.basename(path).startswith("."), status_code=404))
+		no_hidden_files_validator = dict(path_validation=util.tornado.path_validation_factory(lambda path: not octoprint.util.is_hidden_path(path), status_code=404))
 
 		def joined_dict(*dicts):
 			if not len(dicts):
@@ -647,7 +649,9 @@ class Server():
 
 		# configure additional template folders for jinja2
 		import jinja2
-		filesystem_loader = jinja2.FileSystemLoader([])
+		import octoprint.util.jinja
+		filesystem_loader = octoprint.util.jinja.FilteredFileSystemLoader([],
+		                                                                  path_filter=lambda x: not octoprint.util.is_hidden_path(x))
 		filesystem_loader.searchpath = self._template_searchpaths
 
 		jinja_loader = jinja2.ChoiceLoader([

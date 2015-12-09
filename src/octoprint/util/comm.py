@@ -262,6 +262,7 @@ class MachineCom(object):
 		self._serial_factory_hooks = self._pluginManager.get_hooks("octoprint.comm.transport.serial.factory")
 
 		# SD status data
+		self._sdEnabled = settings().getBoolean(["feature", "sdSupport"])
 		self._sdAvailable = False
 		self._sdFileList = False
 		self._sdFiles = []
@@ -719,21 +720,28 @@ class MachineCom(object):
 		return self._sdFiles
 
 	def startSdFileTransfer(self, filename):
-		if not self.isOperational() or self.isBusy():
+		if not self._sdEnabled:
 			return
 
+		if not self.isOperational() or self.isBusy():
+			return
 		self._changeState(self.STATE_TRANSFERING_FILE)
 		self.sendCommand("M28 %s" % filename.lower())
 
 	def endSdFileTransfer(self, filename):
-		if not self.isOperational() or self.isBusy():
+		if not self._sdEnabled:
 			return
 
+		if not self.isOperational() or self.isBusy():
+			return
 		self.sendCommand("M29 %s" % filename.lower())
 		self._changeState(self.STATE_OPERATIONAL)
 		self.refreshSdFiles()
 
 	def deleteSdFile(self, filename):
+		if not self._sdEnabled:
+			return
+
 		if not self.isOperational() or (self.isBusy() and
 				isinstance(self._currentFile, PrintingSdFileInformation) and
 				self._currentFile.getFilename() == filename):
@@ -744,13 +752,21 @@ class MachineCom(object):
 		self.refreshSdFiles()
 
 	def refreshSdFiles(self):
+		if not self._sdEnabled:
+			return
+
 		if not self.isOperational() or self.isBusy():
 			return
+
 		self.sendCommand("M20")
 
 	def initSdCard(self):
+		if not self._sdEnabled:
+			return
+
 		if not self.isOperational():
 			return
+
 		self.sendCommand("M21")
 		if settings().getBoolean(["feature", "sdAlwaysAvailable"]):
 			self._sdAvailable = True
@@ -758,6 +774,9 @@ class MachineCom(object):
 			self._callback.on_comm_sd_state_change(self._sdAvailable)
 
 	def releaseSdCard(self):
+		if not self._sdEnabled:
+			return
+
 		if not self.isOperational() or (self.isBusy() and self.isSdFileSelected()):
 			# do not release the sd card if we are currently printing from it
 			return
@@ -1314,6 +1333,11 @@ class MachineCom(object):
 		return False
 
 	def _handleErrors(self, line):
+		if line is None:
+			return
+
+		lower_line = line.lower()
+
 		# No matter the state, if we see an error, goto the error state and store the error for reference.
 		if line.startswith('Error:') or line.startswith('!!'):
 			#Oh YEAH, consistency.
@@ -1323,13 +1347,17 @@ class MachineCom(object):
 			if regex_minMaxError.match(line):
 				line = line.rstrip() + self._readline()
 
-			if 'line number' in line.lower() or 'checksum' in line.lower() or 'format error' in line.lower() or 'expected line' in line.lower():
+			if 'line number' in lower_line or 'checksum' in lower_line or 'format error' in lower_line or 'expected line' in lower_line:
 				#Skip the communication errors, as those get corrected.
 				self._lastCommError = line[6:] if line.startswith("Error:") else line[2:]
 				pass
-			elif 'volume.init' in line.lower() or "openroot" in line.lower() or 'workdir' in line.lower()\
-					or "error writing to file" in line.lower():
+			elif 'volume.init' in lower_line or "openroot" in lower_line or 'workdir' in lower_line\
+					or "error writing to file" in lower_line or "cannot open" in lower_line\
+					or "cannot enter" in lower_line:
 				#Also skip errors with the SD card
+				pass
+			elif 'unknown command' in lower_line:
+				#Ignore unkown command errors, it could be a typo or some missing feature
 				pass
 			elif not self.isError():
 				self._errorValue = line[6:] if line.startswith("Error:") else line[2:]
@@ -1701,6 +1729,18 @@ class MachineCom(object):
 		return None, # Don't send the M0 or M1 to the machine, as M0 and M1 are handled as an LCD menu pause.
 	_gcode_M1_queuing = _gcode_M0_queuing
 
+	def _gcode_M25_queuing(self, cmd, cmd_type=None):
+		# M25 while not printing from SD will be handled as pause. This way it can be used as another marker
+		# for GCODE induced pausing. Send it to the printer anyway though.
+		if self.isPrinting() and not self.isSdPrinting():
+			self.setPause(True)
+
+	def _gcode_M140_queuing(self, cmd, cmd_type=None):
+		if not self._printerProfileManager.get_current_or_default()["heatedBed"]:
+			self._log("Warn: Not sending \"{}\", printer profile has no heated bed".format(cmd))
+			return None, # Don't send bed commands if we don't have a heated bed
+	_gcode_M190_queuing = _gcode_M140_queuing
+
 	def _gcode_M104_sent(self, cmd, cmd_type=None):
 		toolNum = self._currentTool
 		toolMatch = regexes_parameters["intT"].search(cmd)
@@ -1774,7 +1814,8 @@ class MachineCom(object):
 		# are going to shutdown the connection in a second anyhow.
 		for tool in range(self._printerProfileManager.get_current_or_default()["extruder"]["count"]):
 			self._doIncrementAndSendWithChecksum("M104 T{tool} S0".format(tool=tool))
-		self._doIncrementAndSendWithChecksum("M140 S0")
+		if self._printerProfileManager.get_current_or_default()["heatedBed"]:
+			self._doIncrementAndSendWithChecksum("M140 S0")
 
 		# close to reset host state
 		self._errorValue = "Closing serial port due to emergency stop M112."
